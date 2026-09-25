@@ -82,6 +82,10 @@ pub(crate) struct Account {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Transaction {
     pub sender: String,
+    /// Signing key for block-level workers that sign real transactions. evm2
+    /// executes recovered intent, so it accepts and ignores this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_key: Option<String>,
     pub to: String,
     pub data: String,
     pub value: String,
