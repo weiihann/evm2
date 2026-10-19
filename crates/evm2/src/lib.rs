@@ -23,7 +23,7 @@ pub mod evm;
 #[doc(hidden)]
 pub use evm::config::EvmTypesHost;
 pub use evm::{
-    AccountInfo, BlockStateAccumulator, Evm, ExecutedTx, InterpreterRunner, JournalEntry,
+    AccountInfo, BlockStateAccumulator, CodeSize, Evm, ExecutedTx, InterpreterRunner, JournalEntry,
     PendingState, TxResult, TxResultExt, TxResultWithState, config,
     config::{
         BaseEvmConfig, BaseEvmConfigSelector, BaseEvmTypes, EvmConfig, EvmConfigSelector, EvmTypes,

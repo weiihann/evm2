@@ -108,6 +108,17 @@ impl<E> MessageResultExt<E> {
     }
 }
 
+/// Result of [`Host::load_account_code_size`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct CodeSizeLoad {
+    /// Byte length of the account's code; 0 for an absent account.
+    pub size: u64,
+    /// Whether the account access was cold.
+    pub is_cold: bool,
+    #[doc(hidden)] // Not public API. Please use an existing constructor.
+    pub _non_exhaustive: (),
+}
+
 /// External host operations.
 pub trait Host<T: EvmTypesHost> {
     /// Returns the active base specification ID.
@@ -174,6 +185,25 @@ pub trait Host<T: EvmTypesHost> {
         target: &Address,
         skip_cold_load: bool,
     ) -> Result<SelfDestructResult, HostError>;
+
+    /// Loads an account and returns its code length without reading bytecode when the length is
+    /// known.
+    ///
+    /// Warming and cold-load skipping behave exactly like [`Self::load_account`]. The default
+    /// reads the code through [`Self::load_account`].
+    #[inline]
+    fn load_account_code_size(
+        &mut self,
+        address: &Address,
+        skip_cold_load: bool,
+    ) -> Result<CodeSizeLoad, HostError> {
+        let account = self.load_account(address, true, skip_cold_load)?;
+        Ok(CodeSizeLoad {
+            size: account.code.len() as u64,
+            is_cold: account.is_cold,
+            _non_exhaustive: (),
+        })
+    }
 }
 
 #[cfg(test)]

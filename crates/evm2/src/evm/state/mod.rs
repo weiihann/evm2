@@ -12,7 +12,7 @@ mod stream;
 mod tracked;
 
 pub(crate) use account::Account;
-pub use account::{AccountHandle, AccountInfo};
+pub use account::{AccountHandle, AccountInfo, CodeSize};
 pub use block::BlockStateAccumulator;
 #[cfg(feature = "account-ext")]
 pub use extension::AccountExtension;
@@ -726,6 +726,7 @@ impl<'a> State<'a> {
             balance,
             code_hash: KECCAK256_EMPTY,
             code: Some(Bytecode::default()),
+            code_size: None,
             _non_exhaustive: (),
             #[cfg(feature = "account-ext")]
             extension,

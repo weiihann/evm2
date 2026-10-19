@@ -121,8 +121,8 @@ use crate::{
     constants::{CALL_DEPTH_LIMIT, EIP7708_TRANSFER_TOPIC},
     env::{BlockEnv, TxEnv},
     interpreter::{
-        Gas, GasTracker, Host, InstrStop, Interpreter, InterpreterPool, Message, MessageKind,
-        MessageResult, MessageResultExt, Word,
+        CodeSizeLoad, Gas, GasTracker, Host, InstrStop, Interpreter, InterpreterPool, Message,
+        MessageKind, MessageResult, MessageResultExt, Word,
     },
     registry::{HandlerResult, TxRegistry},
     trustme,
@@ -175,7 +175,7 @@ mod state;
 #[cfg(feature = "account-ext")]
 pub use state::AccountExtension;
 pub use state::{
-    AccountChangeRef, AccountHandle, AccountInfo, BlockStateAccumulator, JournalEntry,
+    AccountChangeRef, AccountHandle, AccountInfo, BlockStateAccumulator, CodeSize, JournalEntry,
     NoopChangeSink, PendingState, State, StateChangeSink, StateChangeSource, StateCheckpoint,
     StateInner, StateSnapshot, StorageChange, StorageHandle, StorageOverlay, StorageSlot,
     StorageSlotHandle, Tee, Tracked,
@@ -1489,6 +1489,25 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
             inspector.initialize_interp(interp);
         }
     }
+
+    /// Loads an account for a host account access and marks it warm, returning whether the access
+    /// was cold.
+    ///
+    /// Shared by every host account load so the cold-load skip and warming cannot drift apart.
+    #[inline]
+    fn warm_account(
+        &mut self,
+        address: &Address,
+        skip_cold_load: bool,
+    ) -> Result<(AccountHandle<'_, 'a>, bool), HostError> {
+        let mut account = match self.state.account_with_skip(address, skip_cold_load) {
+            Ok(account) => account,
+            Err(LoadError::ColdLoadSkipped) => return Err(InstrStop::OutOfGas.into()),
+            Err(code) => return Err(code.into()),
+        };
+        let is_cold = account.warm();
+        Ok((account, is_cold))
+    }
 }
 
 impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
@@ -1506,12 +1525,7 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
         load_code: bool,
         skip_cold_load: bool,
     ) -> Result<AccountLoad, HostError> {
-        let mut account = match self.state.account_with_skip(address, skip_cold_load) {
-            Ok(account) => account,
-            Err(LoadError::ColdLoadSkipped) => return Err(InstrStop::OutOfGas.into()),
-            Err(code) => return Err(code.into()),
-        };
-        let is_cold = account.warm();
+        let (mut account, is_cold) = self.warm_account(address, skip_cold_load)?;
 
         let exists = account.exists();
         let info = account.get().cloned().unwrap_or_default();
@@ -1532,6 +1546,16 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
             is_cold,
             _non_exhaustive: (),
         })
+    }
+
+    fn load_account_code_size(
+        &mut self,
+        address: &Address,
+        skip_cold_load: bool,
+    ) -> Result<CodeSizeLoad, HostError> {
+        let (mut account, is_cold) = self.warm_account(address, skip_cold_load)?;
+        let size = account.code_size().map_err(HostError::from)?;
+        Ok(CodeSizeLoad { size, is_cold, _non_exhaustive: () })
     }
 
     fn target_is_empty_for_new_account_gas(
@@ -1822,7 +1846,7 @@ mod tests {
         interpreter::{GasTracker, Interpreter, Message, MessageExt, MessageKind, op},
         precompiles::{Precompile, PrecompileError, PrecompileId, PrecompileMap},
         registry::{HandlerError, TxRequest, handler},
-        test_utils::{legacy_bytecode, push_address},
+        test_utils::{legacy_bytecode, push, push_address},
     };
     use alloc::{borrow::Cow, string::ToString, sync::Arc, vec, vec::Vec};
     use alloy_consensus::{TxLegacy, transaction::Recovered};
@@ -4055,6 +4079,229 @@ mod tests {
                     .unwrap(),
                 Word::from(1)
             );
+        }
+    }
+
+    const CODE_SIZE_TARGET: Address = Address::with_last_byte(0xc5);
+    const CODE_SIZE_PROBE: Address = Address::with_last_byte(0xc6);
+    const CODE_SIZE_DELEGATE: Address = Address::with_last_byte(0xc7);
+
+    fn sized_code(len: usize) -> Bytecode {
+        legacy_bytecode(vec![op::JUMPDEST; len])
+    }
+
+    /// A database whose target account came in with its code, so the cache keeps only its length.
+    fn known_size_db(code: Bytecode) -> InMemoryDB {
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            &CODE_SIZE_TARGET,
+            AccountInfo::default().with_nonce(1).with_code(code),
+        );
+        assert!(db.account_info(&CODE_SIZE_TARGET).unwrap().code.is_none());
+        db
+    }
+
+    /// A database whose target account has neither its code nor a recorded length.
+    fn unknown_size_db(code: Bytecode) -> InMemoryDB {
+        let mut db = InMemoryDB::default();
+        let code_hash = code.hash_slow();
+        db.cache.contracts.insert(code_hash, code);
+        db.cache
+            .accounts
+            .insert(CODE_SIZE_TARGET, Some(AccountInfo::new(U256::ZERO, 1, code_hash, None)));
+        db
+    }
+
+    fn code_size_evm(spec: SpecId, db: InMemoryDB) -> Evm<'static, BaseEvmTypes> {
+        Evm::<BaseEvmTypes>::new(
+            spec,
+            BlockEnvExt::default(),
+            TxRegistry::new(),
+            DbStats::new(db),
+            Precompiles::base(spec),
+        )
+    }
+
+    /// Runs `EXTCODESIZE(CODE_SIZE_TARGET)` `accesses` times and returns the last result.
+    fn extcodesize_probe(accesses: usize) -> Bytecode {
+        let mut code = Vec::new();
+        for access in 0..accesses {
+            if access > 0 {
+                code.push(op::POP);
+            }
+            push_address(&mut code, &CODE_SIZE_TARGET);
+            code.push(op::EXTCODESIZE);
+        }
+        code.extend([op::PUSH1, 0, op::MSTORE, op::PUSH1, 32, op::PUSH1, 0, op::RETURN]);
+        legacy_bytecode(code)
+    }
+
+    fn run_code_size_probe(
+        evm: &mut Evm<'static, BaseEvmTypes>,
+        code: Bytecode,
+        gas_limit: u64,
+    ) -> (MessageResult, DbStatsCounts) {
+        let mut message = MessageExt {
+            kind: MessageKind::Call,
+            destination: CODE_SIZE_PROBE,
+            code_address: CODE_SIZE_PROBE,
+            gas_limit,
+            code,
+            ..MessageExt::default()
+        };
+        let result = Host::execute_message(evm, &TxEnvExt::default(), &mut message).unwrap();
+        let counts = evm.database().downcast_ref::<DbStats<InMemoryDB>>().unwrap().counts();
+        (result, counts)
+    }
+
+    fn returned_word(result: &MessageResult) -> u64 {
+        assert_eq!(result.stop, InstrStop::Return);
+        U256::from_be_slice(&result.output).to::<u64>()
+    }
+
+    #[test]
+    fn extcodesize_known_size_reads_no_code() {
+        let mut evm = code_size_evm(SpecId::OSAKA, known_size_db(sized_code(0x42)));
+        let (result, counts) = run_code_size_probe(&mut evm, extcodesize_probe(2), 100_000);
+        assert_eq!(returned_word(&result), 0x42);
+        assert_eq!(counts.get_code_by_hash, 0);
+    }
+
+    #[test]
+    fn extcodesize_unknown_size_reads_code_once() {
+        let mut evm = code_size_evm(SpecId::OSAKA, unknown_size_db(sized_code(0x42)));
+        let (result, counts) = run_code_size_probe(&mut evm, extcodesize_probe(1), 100_000);
+        assert_eq!(returned_word(&result), 0x42);
+        assert_eq!(counts.get_code_by_hash, 1);
+    }
+
+    #[test]
+    fn extcodesize_values() {
+        let code = sized_code(0x42);
+        let designator = Bytecode::new_eip7702(CODE_SIZE_DELEGATE);
+
+        let mut eoa = InMemoryDB::default();
+        eoa.insert_account_info(&CODE_SIZE_TARGET, AccountInfo::default().with_balance(U256::ONE));
+
+        // The record names the old hash; something outside the forks rewrote `code_hash` in place.
+        let replacement = sized_code(0x17);
+        let replacement_hash = replacement.hash_slow();
+        let mut stale = InMemoryDB::default();
+        stale.cache.contracts.insert(replacement_hash, replacement);
+        let mut stale_info =
+            AccountInfo::new(U256::ZERO, 1, code.hash_slow(), None).with_code_size(Some(0x42));
+        stale_info.code_hash = replacement_hash;
+        stale.cache.accounts.insert(CODE_SIZE_TARGET, Some(stale_info));
+
+        // EXTCODESIZE reads the designator itself, not the delegate's code.
+        let mut delegated = known_size_db(designator.clone());
+        delegated.insert_account_info(
+            &CODE_SIZE_DELEGATE,
+            AccountInfo::default().with_code(sized_code(0x99)),
+        );
+        let mut delegated_unknown = unknown_size_db(designator);
+        delegated_unknown.insert_account_info(
+            &CODE_SIZE_DELEGATE,
+            AccountInfo::default().with_code(sized_code(0x99)),
+        );
+
+        let cases = [
+            ("absent", InMemoryDB::default(), 0, 0),
+            ("eoa", eoa, 0, 0),
+            ("known", known_size_db(code.clone()), 0x42, 0),
+            ("unknown", unknown_size_db(code), 0x42, 1),
+            ("stale tag", stale, 0x17, 1),
+            ("7702 designator", delegated, 23, 0),
+            ("7702 designator, unknown size", delegated_unknown, 23, 1),
+        ];
+        for (name, db, size, code_reads) in cases {
+            let mut evm = code_size_evm(SpecId::OSAKA, db);
+            let (result, counts) = run_code_size_probe(&mut evm, extcodesize_probe(1), 100_000);
+            assert_eq!(returned_word(&result), size, "{name}");
+            assert_eq!(counts.get_code_by_hash, code_reads, "{name}");
+        }
+    }
+
+    #[test]
+    fn extcodesize_tracks_delegation_changes_in_the_transaction() {
+        let mut evm =
+            code_size_evm(SpecId::OSAKA, known_size_db(Bytecode::new_eip7702(CODE_SIZE_DELEGATE)));
+        evm.state.account(&CODE_SIZE_TARGET).unwrap().set_delegation(Address::ZERO);
+        let (result, counts) = run_code_size_probe(&mut evm, extcodesize_probe(1), 100_000);
+        assert_eq!(returned_word(&result), 0, "cleared delegation");
+        assert_eq!(counts.get_code_by_hash, 0);
+
+        let mut evm = code_size_evm(SpecId::OSAKA, InMemoryDB::default());
+        evm.state.account(&CODE_SIZE_TARGET).unwrap().set_delegation(CODE_SIZE_DELEGATE);
+        let (result, counts) = run_code_size_probe(&mut evm, extcodesize_probe(1), 100_000);
+        assert_eq!(returned_word(&result), 23, "new delegation");
+        assert_eq!(counts.get_code_by_hash, 0);
+    }
+
+    #[test]
+    fn extcodesize_sees_same_transaction_deploy_and_zero_in_constructor() {
+        const RUNTIME_LEN: u8 = 0x21;
+        // Stores `EXTCODESIZE(ADDRESS) + 1` in slot 0, then returns `RUNTIME_LEN` zero bytes.
+        let initcode = [
+            op::ADDRESS,
+            op::EXTCODESIZE,
+            op::PUSH1,
+            1,
+            op::ADD,
+            op::PUSH1,
+            0,
+            op::SSTORE,
+            op::PUSH1,
+            RUNTIME_LEN,
+            op::PUSH1,
+            0,
+            op::RETURN,
+        ];
+        let mut code = Vec::new();
+        push(&mut code, Word::from_be_slice(&initcode));
+        code.extend([op::PUSH1, 0, op::MSTORE]);
+        push(&mut code, initcode.len());
+        push(&mut code, 32 - initcode.len());
+        code.extend([op::PUSH1, 0, op::CREATE, op::EXTCODESIZE]);
+        code.extend([op::PUSH1, 0, op::MSTORE, op::PUSH1, 32, op::PUSH1, 0, op::RETURN]);
+
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(&CODE_SIZE_PROBE, AccountInfo::default().with_nonce(1));
+        let mut evm = code_size_evm(SpecId::OSAKA, db);
+        let (result, _) = run_code_size_probe(&mut evm, legacy_bytecode(code), 1_000_000);
+        assert_eq!(returned_word(&result), u64::from(RUNTIME_LEN));
+        let created = CODE_SIZE_PROBE.create(1);
+        let in_constructor = evm.state.storage_slot(&created, Word::ZERO).unwrap().current();
+        assert_eq!(in_constructor, Word::from(1));
+    }
+
+    #[test]
+    fn extcodesize_gas_unchanged() {
+        const GAS_LIMIT: u64 = 100_000;
+        let code = sized_code(0x42);
+        for spec in [SpecId::OSAKA, SpecId::AMSTERDAM] {
+            let run = |db, accesses, gas_limit| {
+                let mut evm = code_size_evm(spec, db);
+                let (result, _) =
+                    run_code_size_probe(&mut evm, extcodesize_probe(accesses), gas_limit);
+                (result.stop, result.gas.remaining())
+            };
+            // Tight limits make the cold surcharge unaffordable, so the host skips the load.
+            for gas_limit in [GAS_LIMIT, 2_000, 2_602, 2_603, 2_700, 2_800] {
+                for accesses in [1, 2] {
+                    assert_eq!(
+                        run(known_size_db(code.clone()), accesses, gas_limit),
+                        run(unknown_size_db(code.clone()), accesses, gas_limit),
+                        "{spec:?}, {accesses} accesses, gas limit {gas_limit}"
+                    );
+                }
+            }
+            assert_eq!(run(known_size_db(code.clone()), 1, 2_000).0, InstrStop::OutOfGas);
+
+            // The second access must be charged warm, far below the first, cold one.
+            let cold = GAS_LIMIT - run(known_size_db(code.clone()), 1, GAS_LIMIT).1;
+            let warm = GAS_LIMIT - run(known_size_db(code.clone()), 2, GAS_LIMIT).1 - cold;
+            assert!(warm < cold / 2, "{spec:?}: cold {cold}, warm {warm}");
         }
     }
 }

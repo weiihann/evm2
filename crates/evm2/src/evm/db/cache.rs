@@ -216,7 +216,7 @@ impl<ExtDB> CacheDB<ExtDB> {
     #[inline]
     pub fn insert_account_info(&mut self, address: &Address, mut info: AccountInfo) {
         self.insert_contract(&mut info);
-        info.code = None;
+        info.drop_code();
         self.cache.accounts.insert(*address, Some(info));
     }
 
@@ -323,7 +323,7 @@ impl<ExtDB: DynDatabase> DynDatabase for CacheDB<ExtDB> {
                 Entry::Vacant(entry) => match self.db.get_account(address)? {
                     Some(mut info) => {
                         Self::insert_contract_inner(contracts, &mut info);
-                        info.code = None;
+                        info.drop_code();
                         entry.insert(Some(info)).clone()
                     }
                     None => entry.insert(None).clone(),
