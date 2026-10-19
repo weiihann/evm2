@@ -1,6 +1,7 @@
 use alloy_primitives::{Address, U256};
 use core::{hint::cold_path, num::NonZero};
 use evm2::{
+    HostError,
     evm::AccountLoad,
     interpreter::Host,
     utils::{word_to_usize, word_to_usize_saturated},
@@ -43,24 +44,50 @@ pub(crate) fn word_to_u64_saturated(value: U256) -> u64 {
     value.try_into().unwrap_or(u64::MAX)
 }
 
-/// Loads an account, handling cold load gas accounting.
+/// Runs a host account access, charging the cold-account surcharge when the access was cold.
 ///
 /// Pre-Berlin, `cold_account_additional_cost` is 0, so the cold load logic is a no-op.
+#[inline]
+fn with_cold_load_gas<R>(
+    ecx: &mut EvmContext<'_, '_, '_>,
+    load: impl FnOnce(&mut EvmContext<'_, '_, '_>, bool) -> Result<R, HostError>,
+    is_cold: impl FnOnce(&R) -> bool,
+) -> Result<R, BuiltinError> {
+    let cold_load_gas = ecx.gas_params().cold_account_additional_cost();
+    let skip_cold_load = ecx.gas.remaining() < cold_load_gas;
+    let loaded = load(ecx, skip_cold_load).map_err(|stop| ecx.interpreter_mut().fail(stop))?;
+    if is_cold(&loaded) {
+        ecx.gas.spend(cold_load_gas)?;
+    }
+    Ok(loaded)
+}
+
+/// Loads an account, handling cold load gas accounting.
 pub(crate) fn load_account(
     ecx: &mut EvmContext<'_, '_, '_>,
     address: &Address,
     load_code: bool,
 ) -> Result<AccountLoad, BuiltinError> {
-    let cold_load_gas = ecx.gas_params().cold_account_additional_cost();
-    let skip_cold_load = ecx.gas.remaining() < cold_load_gas;
-    let account = ecx
-        .host()
-        .load_account(address, load_code, skip_cold_load)
-        .map_err(|stop| ecx.interpreter_mut().fail(stop))?;
-    if account.is_cold {
-        ecx.gas.spend(cold_load_gas)?;
-    }
-    Ok(account)
+    with_cold_load_gas(
+        ecx,
+        |ecx, skip_cold_load| ecx.host().load_account(address, load_code, skip_cold_load),
+        |account| account.is_cold,
+    )
+}
+
+/// Loads an account's code length, handling cold load gas accounting.
+///
+/// Reads bytecode only when the host does not know the length.
+pub(crate) fn load_code_size(
+    ecx: &mut EvmContext<'_, '_, '_>,
+    address: &Address,
+) -> Result<u64, BuiltinError> {
+    let loaded = with_cold_load_gas(
+        ecx,
+        |ecx, skip_cold_load| ecx.host().load_account_code_size(address, skip_cold_load),
+        |loaded| loaded.is_cold,
+    )?;
+    Ok(loaded.size)
 }
 
 /// Splits the stack pointer into `N` elements by casting it to an array.

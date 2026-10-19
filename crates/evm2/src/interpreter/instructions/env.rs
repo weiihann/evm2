@@ -1,5 +1,5 @@
 use crate::{
-    EvmTypesHost,
+    EvmTypesHost, HostError,
     evm::AccountLoad,
     interpreter::{Gas, Host, InstrStop, Memory, Result, Word, private::GasInstructionCx},
     utils::{
@@ -7,26 +7,57 @@ use crate::{
     },
     version::GasParams,
 };
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use evm2_macros::instruction;
+
+/// Runs a host account access, charging the cold-account surcharge when the access was cold.
+///
+/// The host skips a cold load the remaining gas cannot cover, so the access fails without reading
+/// state.
+#[inline]
+fn with_cold_load_gas<T: EvmTypesHost, R>(
+    cx: &mut GasInstructionCx<'_, '_, '_, T>,
+    addr: Word,
+    load: impl FnOnce(&mut GasInstructionCx<'_, '_, '_, T>, &Address, bool) -> Result<R, HostError>,
+    is_cold: impl FnOnce(&R) -> bool,
+) -> Result<R> {
+    let cold_load_gas = cx.state.gas_params().cold_account_additional_cost();
+    let skip_cold_load = cx.gas.remaining() < cold_load_gas;
+    let account_address = word_to_address(addr);
+    let loaded =
+        load(cx, &account_address, skip_cold_load).map_err(|error| cx.state.fail(error))?;
+    if is_cold(&loaded) {
+        cx.gas.spend(cold_load_gas)?;
+    }
+    Ok(loaded)
+}
 
 fn load_account<T: EvmTypesHost>(
     cx: &mut GasInstructionCx<'_, '_, '_, T>,
     addr: Word,
     load_code: bool,
 ) -> Result<AccountLoad> {
-    let cold_load_gas = cx.state.gas_params().cold_account_additional_cost();
-    let skip_cold_load = cx.gas.remaining() < cold_load_gas;
-    let account_address = word_to_address(addr);
-    let account = cx
-        .state
-        .host()
-        .load_account(&account_address, load_code, skip_cold_load)
-        .map_err(|error| cx.state.fail(error))?;
-    if account.is_cold {
-        cx.gas.spend(cold_load_gas)?;
-    }
-    Ok(account)
+    with_cold_load_gas(
+        cx,
+        addr,
+        |cx, target, skip_cold_load| {
+            cx.state.host().load_account(target, load_code, skip_cold_load)
+        },
+        |account| account.is_cold,
+    )
+}
+
+fn load_code_size<T: EvmTypesHost>(
+    cx: &mut GasInstructionCx<'_, '_, '_, T>,
+    addr: Word,
+) -> Result<u64> {
+    let loaded = with_cold_load_gas(
+        cx,
+        addr,
+        |cx, target, skip_cold_load| cx.state.host().load_account_code_size(target, skip_cold_load),
+        |loaded| loaded.is_cold,
+    )?;
+    Ok(loaded.size)
 }
 
 #[inline]
@@ -119,7 +150,7 @@ pub fn gasprice(cx: _) -> out {
 
 #[instruction(dynamic_gas)]
 pub fn extcodesize(cx: _, [addr]: [Word]) -> Result<out> {
-    *out = Word::from(load_account(&mut cx, *addr, true)?.code.len());
+    *out = Word::from(load_code_size(&mut cx, *addr)?);
 }
 
 #[instruction(dynamic_gas)]

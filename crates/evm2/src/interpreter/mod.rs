@@ -35,7 +35,7 @@ mod message;
 pub use message::{Message, MessageExt, MessageKind, derive_create_destination};
 
 mod host;
-pub use host::{Host, MessageResult, MessageResultExt};
+pub use host::{CodeSizeLoad, Host, MessageResult, MessageResultExt};
 
 mod runtime;
 pub(crate) use runtime::InterpreterPool;

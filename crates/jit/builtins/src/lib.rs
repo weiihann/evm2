@@ -304,8 +304,8 @@ pub unsafe extern "C" fn __revmc_builtin_extcodesize(
     ecx: &mut EvmContext,
     address: &mut EvmWord,
 ) -> BuiltinResult {
-    let account = load_account(ecx, &address.to_address(), true)?;
-    *address = U256::from(account.code.len()).into();
+    let size = load_code_size(ecx, &address.to_address())?;
+    *address = U256::from(size).into();
     Ok(())
 }
 
