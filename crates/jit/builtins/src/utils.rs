@@ -76,8 +76,6 @@ pub(crate) fn load_account(
 }
 
 /// Loads an account's code length, handling cold load gas accounting.
-///
-/// Reads bytecode only when the host does not know the length.
 pub(crate) fn load_code_size(
     ecx: &mut EvmContext<'_, '_, '_>,
     address: &Address,

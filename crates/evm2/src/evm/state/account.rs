@@ -193,7 +193,6 @@ impl AccountInfo {
         self
     }
 
-    /// Returns the known code length as a record tied to the current `code_hash`.
     #[inline]
     fn retained_code_size(&self) -> Option<CodeSize> {
         CodeSize::new(self.code_hash, self.known_code_size()?)
@@ -502,8 +501,7 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
 
     /// Returns the account's code length, reading bytecode only when the length is unknown.
     ///
-    /// Returns 0 when the account is absent. The fallback read does not record the length, so the
-    /// worst case costs the same single read as [`Self::load_code`].
+    /// Returns 0 when the account is absent. The fallback read does not record the length.
     #[inline]
     pub fn code_size(&mut self) -> DbResult<u64> {
         let Some(account) = self.tracked.present.as_ref() else {
@@ -1025,21 +1023,26 @@ mod tests {
         let code = contract_code(5);
         let hash = code.hash_slow();
 
-        // The empty code hash is always 0, whatever is recorded.
         assert_eq!(AccountInfo::default().known_code_size(), Some(0));
         assert_eq!(AccountInfo::empty().known_code_size(), Some(0));
         let mut emptied = AccountInfo::empty().with_code(code.clone()).with_code_size(Some(5));
         emptied.code_hash = KECCAK256_EMPTY;
-        assert_eq!(emptied.known_code_size(), Some(0));
+        assert_eq!(
+            emptied.known_code_size(),
+            Some(0),
+            "empty code hash is 0, whatever is recorded"
+        );
 
-        // Cached non-empty code is measured directly, including an EIP-7702 designator.
         let cached = AccountInfo::empty().with_code(code);
         assert_eq!(cached.known_code_size(), Some(5));
         assert_eq!(cached.with_code_size(Some(9)).known_code_size(), Some(5));
         let designator = Bytecode::new_eip7702(Address::repeat_byte(1));
-        assert_eq!(AccountInfo::empty().with_code(designator).known_code_size(), Some(23));
+        assert_eq!(
+            AccountInfo::empty().with_code(designator).known_code_size(),
+            Some(23),
+            "cached non-empty code is measured directly, including an EIP-7702 designator"
+        );
 
-        // Without code, a record counts only under the hash it was measured at.
         let uncached = AccountInfo::new(U256::ZERO, 1, hash, None);
         assert_eq!(uncached.known_code_size(), None);
         let recorded = uncached.with_code_size(Some(5));
@@ -1049,15 +1052,25 @@ mod tests {
         assert_eq!(empty_cache.known_code_size(), Some(5));
         let mut rewritten = recorded.clone();
         rewritten.code_hash = B256::repeat_byte(0x22);
-        assert_eq!(rewritten.known_code_size(), None);
+        assert_eq!(
+            rewritten.known_code_size(),
+            None,
+            "without code, a record counts only under the hash it was measured at"
+        );
 
-        // A record whose hash came back is valid again: it was measured under that hash.
         rewritten.code_hash = hash;
-        assert_eq!(rewritten.known_code_size(), Some(5));
+        assert_eq!(rewritten.known_code_size(), Some(5), "record is valid again under its hash");
 
-        // `with_code_size` ties to the current hash; zero and `None` clear the record.
-        assert_eq!(recorded.clone().with_code_size(Some(0)).known_code_size(), None);
-        assert_eq!(recorded.with_code_size(None).known_code_size(), None);
+        assert_eq!(
+            recorded.clone().with_code_size(Some(0)).known_code_size(),
+            None,
+            "`with_code_size` ties to the current hash; zero clears the record"
+        );
+        assert_eq!(
+            recorded.with_code_size(None).known_code_size(),
+            None,
+            "`None` clears the record"
+        );
     }
 
     #[test]
@@ -1068,14 +1081,20 @@ mod tests {
         assert!(account.code.is_none());
         assert_eq!(account.known_code_size(), Some(7));
 
-        // The frozen record is tied to the hash at drop time.
         account.code_hash = B256::repeat_byte(0x33);
-        assert_eq!(account.known_code_size(), None);
+        assert_eq!(
+            account.known_code_size(),
+            None,
+            "frozen record is tied to the hash at drop time"
+        );
 
-        // Dropping again with nothing known clears the record instead of carrying a stale one.
         account.drop_code();
         account.code_hash = code.hash_slow();
-        assert_eq!(account.known_code_size(), None);
+        assert_eq!(
+            account.known_code_size(),
+            None,
+            "dropping again with nothing known clears the record"
+        );
 
         let mut unknown = AccountInfo::new(U256::ZERO, 1, code.hash_slow(), None);
         unknown.drop_code();
