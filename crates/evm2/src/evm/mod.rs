@@ -1490,10 +1490,9 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         }
     }
 
-    /// Loads an account for a host account access and marks it warm, returning whether the access
-    /// was cold.
-    ///
-    /// Shared by every host account load so the cold-load skip and warming cannot drift apart.
+    /// Loads and warms an account for [`Self::load_account`] and [`Self::load_account_code_size`],
+    /// returning whether the access was cold, so their cold-load skip and warming cannot drift
+    /// apart.
     #[inline]
     fn warm_account(
         &mut self,
@@ -4183,7 +4182,6 @@ mod tests {
         let mut eoa = InMemoryDB::default();
         eoa.insert_account_info(&CODE_SIZE_TARGET, AccountInfo::default().with_balance(U256::ONE));
 
-        // The record names the old hash; something outside the forks rewrote `code_hash` in place.
         let replacement = sized_code(0x17);
         let replacement_hash = replacement.hash_slow();
         let mut stale = InMemoryDB::default();
@@ -4298,7 +4296,6 @@ mod tests {
             }
             assert_eq!(run(known_size_db(code.clone()), 1, 2_000).0, InstrStop::OutOfGas);
 
-            // The second access must be charged warm, far below the first, cold one.
             let cold = GAS_LIMIT - run(known_size_db(code.clone()), 1, GAS_LIMIT).1;
             let warm = GAS_LIMIT - run(known_size_db(code.clone()), 2, GAS_LIMIT).1 - cold;
             assert!(warm < cold / 2, "{spec:?}: cold {cold}, warm {warm}");
