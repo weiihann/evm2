@@ -18,7 +18,10 @@ use evm2::{
     BaseEvmTypes, EvmTypesHost,
     bytecode::Bytecode,
     constants::BLOCK_HASH_HISTORY,
-    interpreter::{Host, MessageExt, MessageKind, Word, derive_create_destination, i256},
+    interpreter::{
+        Host, MessageExt, MessageKind, Word, derive_create_destination, i256,
+        instructions::charge_call_target,
+    },
     utils::read_word_padded,
     version::{EvmFeatures, GasId},
 };
@@ -884,69 +887,26 @@ fn load_acc_and_calc_gas<T: EvmTypesHost>(
     create_empty_account: bool,
     stack_gas_limit: u64,
 ) -> Result<(u64, u64, Bytecode, Address), BuiltinError> {
-    let version = *ecx.version();
-    if transfers_value {
-        ecx.gas.spend(version.gas_params.get(GasId::TransferValueCost))?;
-    }
+    // The host and the gas both live behind `ecx`, so the gas is charged through a copy.
+    let mut gas = *ecx.gas.tracker();
+    let target =
+        charge_call_target::<T, _>(ecx.host(), &mut gas, to, transfers_value, create_empty_account);
+    *ecx.gas.tracker_mut() = gas;
+    let target = target.map_err(|error| ecx.interpreter_mut().fail(error))?;
 
-    let additional_cold_cost = version.gas_params.cold_account_additional_cost();
-    let remaining_gas = ecx.gas.remaining();
-    let skip_cold_load = remaining_gas < additional_cold_cost;
-    let account = ecx
-        .host()
-        .load_account(&to, true, skip_cold_load)
-        .map_err(|stop| ecx.interpreter_mut().fail(stop))?;
-
-    let mut cost = 0;
-    if account.is_cold {
-        cost += additional_cold_cost;
-    }
-    let mut new_account_state_gas = 0;
-    let mut code = account.code;
-    let mut code_address = to;
-    if ecx.enables(EvmFeatures::EIP7702)
-        && let Some(delegated_address) = code.eip7702_address()
-    {
-        cost += version.gas_params.get(GasId::WarmStorageReadCost);
-        if cost > remaining_gas {
-            return Err(InstrStop::OutOfGas.into());
-        }
-        let skip_cold_load = remaining_gas < cost.saturating_add(additional_cold_cost);
-        let delegated_account = ecx
-            .host()
-            .load_account(&delegated_address, true, skip_cold_load)
-            .map_err(|stop| ecx.interpreter_mut().fail(stop))?;
-        if delegated_account.is_cold {
-            cost += additional_cold_cost;
-        }
-        code = delegated_account.code;
-        code_address = delegated_address;
-    }
-    let features = ecx.version().features;
-    if create_empty_account
-        && (!features.contains(EvmFeatures::EIP161) || transfers_value)
-        && account.is_empty_for_new_account_gas
-    {
-        cost += version.gas_params.get(GasId::NewAccountCost);
-        if features.contains(EvmFeatures::EIP8037) && transfers_value {
-            new_account_state_gas = version.gas_params.new_account_state_gas();
-        }
-    }
-    ecx.gas.spend(cost)?;
-    ecx.gas.spend_state(new_account_state_gas)?;
-
-    let mut gas_limit = if ecx.enables(EvmFeatures::EIP150) {
-        min(version.gas_params.call_stipend_reduction(ecx.gas.remaining()), stack_gas_limit)
+    let gas_limit = if ecx.enables(EvmFeatures::EIP150) {
+        min(ecx.gas_params().call_stipend_reduction(ecx.gas.remaining()), stack_gas_limit)
     } else {
         stack_gas_limit
     };
     ecx.gas.spend(gas_limit)?;
 
-    if transfers_value {
-        gas_limit = gas_limit.saturating_add(version.gas_params.get(GasId::CallStipend));
-    }
-
-    Ok((gas_limit, new_account_state_gas, code, code_address))
+    Ok((
+        gas_limit.saturating_add(target.stipend),
+        target.new_account_state_gas,
+        target.code,
+        target.code_address,
+    ))
 }
 
 #[inline]

@@ -1,11 +1,11 @@
 //! System opcode implementations.
 
 use crate::{
-    EvmFeatures, EvmTypesHost,
+    EvmFeatures, EvmTypesHost, HostError,
     bytecode::Bytecode,
     interpreter::{
-        Gas, Host, InstrStop, InterpreterState, Message, MessageExt, MessageKind, MessageResult,
-        Result, StackMut, Word, derive_create_destination,
+        Gas, GasTracker, Host, InstrStop, InterpreterState, Message, MessageExt, MessageKind,
+        MessageResult, Result, StackMut, Word, derive_create_destination,
     },
     utils::WordExt,
     version::GasId,
@@ -71,6 +71,91 @@ fn memory_range_bytes<T: EvmTypesHost>(
     Ok(Bytes::copy_from_slice(state.memory().slice(range.start, range.len())))
 }
 
+/// What a CALL-family instruction reaches once [`charge_call_target`] has charged for it.
+#[derive(Clone, Debug)]
+pub struct CallTarget {
+    /// Code the call runs: the target's own, or its EIP-7702 delegate's.
+    pub code: Bytecode,
+    /// Address the code was loaded from.
+    pub code_address: Address,
+    /// EIP-8037 state gas charged for creating the target, refunded when the call fails.
+    pub new_account_state_gas: u64,
+    /// Gas the callee receives on top of the forwarded gas: the value-transfer stipend.
+    pub stipend: u64,
+    #[doc(hidden)] // Not public API. Please use an existing constructor.
+    pub _non_exhaustive: (),
+}
+
+/// Charges `gas` what a CALL-family instruction pays to reach `to` after its static cost: the
+/// value transfer, the EIP-2929 cold-access premium, an EIP-7702 delegate's access, and the
+/// new-account cost when the call creates `to`. Splitting the remaining gas for the callee is left
+/// to the caller.
+///
+/// A cold account the remaining gas cannot cover is not loaded. Running out of gas returns
+/// [`HostError::Halt`] with [`InstrStop::OutOfGas`].
+pub fn charge_call_target<T: EvmTypesHost, H: Host<T> + ?Sized>(
+    host: &mut H,
+    gas: &mut GasTracker,
+    to: Address,
+    transfers_value: bool,
+    create_empty_account: bool,
+) -> core::result::Result<CallTarget, HostError> {
+    let version = host.execution_config().version();
+    let features = version.features;
+    let params = &version.gas_params;
+    let transfer_cost = params.get(GasId::TransferValueCost);
+    let additional_cold_cost = params.cold_account_additional_cost();
+    let delegate_warm_cost = params.get(GasId::WarmStorageReadCost);
+    let new_account_cost = params.get(GasId::NewAccountCost);
+    let new_account_state_cost = params.new_account_state_gas();
+    let stipend = if transfers_value { params.get(GasId::CallStipend) } else { 0 };
+
+    if transfers_value {
+        gas.spend(transfer_cost)?;
+    }
+    let remaining_gas = gas.remaining();
+    let skip_cold_load = remaining_gas < additional_cold_cost;
+    let account = host.load_account(&to, true, skip_cold_load)?;
+
+    let mut cost = 0;
+    if account.is_cold {
+        cost += additional_cold_cost;
+    }
+    let mut code = account.code;
+    let mut code_address = to;
+    if features.contains(EvmFeatures::EIP7702)
+        && let Some(delegated_address) = code.eip7702_address()
+    {
+        cost += delegate_warm_cost;
+        if cost > remaining_gas {
+            return Err(InstrStop::OutOfGas.into());
+        }
+        let skip_cold_load = remaining_gas < cost.saturating_add(additional_cold_cost);
+        let delegated_account = host.load_account(&delegated_address, true, skip_cold_load)?;
+        if delegated_account.is_cold {
+            cost += additional_cold_cost;
+        }
+        code = delegated_account.code;
+        code_address = delegated_address;
+    }
+    let mut new_account_state_gas = 0;
+    if create_empty_account
+        && (!features.contains(EvmFeatures::EIP161) || transfers_value)
+        && account.is_empty_for_new_account_gas
+    {
+        cost += new_account_cost;
+        // EIP-8037: value transfer to a new account also charges state gas from
+        // the reservoir, before the caller splits the remaining gas.
+        if features.contains(EvmFeatures::EIP8037) && transfers_value {
+            new_account_state_gas = new_account_state_cost;
+        }
+    }
+    gas.spend(cost)?;
+    gas.spend_state(new_account_state_gas)?;
+
+    Ok(CallTarget { code, code_address, new_account_state_gas, stipend, _non_exhaustive: () })
+}
+
 fn load_acc_and_calc_gas<T: EvmTypesHost>(
     gas: &mut Gas,
     state: &mut InterpreterState<'_, '_, T>,
@@ -79,57 +164,16 @@ fn load_acc_and_calc_gas<T: EvmTypesHost>(
     create_empty_account: bool,
     stack_gas_limit: u64,
 ) -> Result<(u64, u64, Bytecode, Address)> {
-    if transfers_value {
-        gas.spend(state.gas_params().get(GasId::TransferValueCost))?;
-    }
+    let target = charge_call_target::<T, _>(
+        state.host(),
+        gas.tracker_mut(),
+        to,
+        transfers_value,
+        create_empty_account,
+    )
+    .map_err(|error| state.fail(error))?;
 
-    let additional_cold_cost = state.gas_params().cold_account_additional_cost();
-    let remaining_gas = gas.remaining();
-    let skip_cold_load = remaining_gas < additional_cold_cost;
-    let account =
-        state.host().load_account(&to, true, skip_cold_load).map_err(|error| state.fail(error))?;
-
-    let mut cost = 0;
-    if account.is_cold {
-        cost += additional_cold_cost;
-    }
-    let mut code = account.code;
-    let mut code_address = to;
-    if state.feature(EvmFeatures::EIP7702)
-        && let Some(delegated_address) = code.eip7702_address()
-    {
-        cost += state.gas_params().get(GasId::WarmStorageReadCost);
-        if cost > remaining_gas {
-            return Err(InstrStop::OutOfGas);
-        }
-        let skip_cold_load = remaining_gas < cost.saturating_add(additional_cold_cost);
-        let delegated_account = state
-            .host()
-            .load_account(&delegated_address, true, skip_cold_load)
-            .map_err(|error| state.fail(error))?;
-        if delegated_account.is_cold {
-            cost += additional_cold_cost;
-        }
-        code = delegated_account.code;
-        code_address = delegated_address;
-    }
-    let features = state.version().features;
-    let mut new_account_state_gas = 0;
-    if create_empty_account
-        && (!features.contains(EvmFeatures::EIP161) || transfers_value)
-        && account.is_empty_for_new_account_gas
-    {
-        cost += state.gas_params().get(GasId::NewAccountCost);
-        // EIP-8037: value transfer to a new account also charges state gas from
-        // the reservoir. Charged before the 63/64 child gas split below.
-        if features.contains(EvmFeatures::EIP8037) && transfers_value {
-            new_account_state_gas = state.gas_params().new_account_state_gas();
-        }
-    }
-    gas.spend(cost)?;
-    gas.spend_state(new_account_state_gas)?;
-
-    let mut gas_limit = if state.feature(EvmFeatures::EIP150) {
+    let gas_limit = if state.feature(EvmFeatures::EIP150) {
         min(state.gas_params().call_stipend_reduction(gas.remaining()), stack_gas_limit)
     } else {
         stack_gas_limit
@@ -137,11 +181,12 @@ fn load_acc_and_calc_gas<T: EvmTypesHost>(
     gas.spend(gas_limit)?;
     state.finish_step_charge(gas);
 
-    if transfers_value {
-        gas_limit = gas_limit.saturating_add(state.gas_params().get(GasId::CallStipend));
-    }
-
-    Ok((gas_limit, new_account_state_gas, code, code_address))
+    Ok((
+        gas_limit.saturating_add(target.stipend),
+        target.new_account_state_gas,
+        target.code,
+        target.code_address,
+    ))
 }
 
 #[inline(never)]
@@ -1274,5 +1319,32 @@ mod tests {
         assert_eq!(hooked.stack(), [Word::ZERO]);
         assert!(host.calls.is_empty());
         assert_eq!(hooked.gas_remaining(), base.gas_remaining());
+    }
+
+    #[test]
+    fn charge_call_target_charges_value_cold_access_and_a_new_account() {
+        let target = Address::from([0x22; 20]);
+        let mut host = TestHost { is_cold: true, is_empty: true, ..Default::default() };
+        let mut gas = GasTracker::new(50_000);
+
+        let charged =
+            charge_call_target::<TestTypes, _>(&mut host, &mut gas, target, true, true).unwrap();
+
+        assert_eq!(50_000 - gas.remaining(), 9_000 + 2_500 + 25_000);
+        assert_eq!(charged.stipend, 2_300);
+        assert_eq!(charged.code_address, target);
+        assert_eq!(host.account_loads, [target]);
+    }
+
+    #[test]
+    fn charge_call_target_leaves_an_unaffordable_cold_target_unread() {
+        let target = Address::from([0x22; 20]);
+        let mut host = TestHost { is_cold: true, ..Default::default() };
+        let mut gas = GasTracker::new(9_000 + 2_499);
+
+        let charged = charge_call_target::<TestTypes, _>(&mut host, &mut gas, target, true, false);
+
+        assert_matches!(charged, Err(HostError::Halt(InstrStop::OutOfGas)));
+        assert!(host.account_loads.is_empty());
     }
 }
