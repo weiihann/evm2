@@ -459,6 +459,20 @@ impl<'a> State<'a> {
         }
     }
 
+    /// Sets whether an already-loaded account is touched, without journaling the change.
+    ///
+    /// Does nothing for unloaded accounts and leaves account values and storage unchanged. An
+    /// embedder that applies EIP-161 dead-account clearing itself can clear the touch before
+    /// transaction finalization, which then keeps the account and its storage.
+    ///
+    /// This call adds no journal entry; rolling back an existing account-change entry still
+    /// restores the account's recorded touch.
+    pub fn set_account_touched(&mut self, address: &Address, touched: bool) {
+        if let Some(account) = self.accounts.get_mut(address) {
+            account.flags.set(AccountFlags::TOUCHED, touched);
+        }
+    }
+
     /// Reads a storage slot from the committed state (accepted overlay and backing database),
     /// ignoring the in-flight transaction overlay.
     #[inline]
@@ -1545,6 +1559,29 @@ mod tests {
             state.set_account_warm(&address, false);
             state.set_account_warm(&address, true);
             assert!(!state.account(&address).unwrap().warm());
+        }
+    }
+
+    #[test]
+    fn clearing_a_touch_keeps_a_dead_account_through_finalization() {
+        let address = Address::with_last_byte(42);
+        let key = Word::from(1);
+        let version = Version::base(crate::SpecId::CANCUN);
+        for cleared in [false, true] {
+            let mut db = CacheDB::default();
+            db.insert_account_info(&address, AccountInfo::default());
+            let mut state = State::new(db);
+            state.set_account_touched(&address, false);
+            assert!(!state.accounts.contains_key(&address));
+            state.account(&address).unwrap().touch();
+            state.storage_slot(&address, key).unwrap().write(Word::from(9));
+            if cleared {
+                state.set_account_touched(&address, false);
+            }
+            state.finalize_transaction_(version);
+            let account = &state.accounts[&address];
+            assert_eq!(account.present.is_some(), cleared);
+            assert_eq!(account.storage.wiped, !cleared);
         }
     }
 
